@@ -30,7 +30,7 @@ import { streamResponse } from './stream'
 import { createStreamRequestBody } from './provider-options'
 import { kebabToSentence } from '../webview/utils'
 import { TwinnyProvider } from './provider-manager'
-import { ConversationHistory } from './conversation-history'
+import { EmbeddingDatabase } from './embeddings'
 
 export class ChatService {
   private _config = workspace.getConfiguration('twinny')
@@ -43,27 +43,51 @@ export class ChatService {
   private _statusBar: StatusBarItem
   private _temperature = this._config.get('temperature') as number
   private _templateProvider?: TemplateProvider
-  private _conversationHistory: ConversationHistory | undefined
   private _view?: WebviewView
+  private _db?: EmbeddingDatabase
 
   constructor(
     statusBar: StatusBarItem,
     templateDir: string,
     extensionContext: ExtensionContext,
-    conversationHistory: ConversationHistory | undefined,
-    view: WebviewView
+    view: WebviewView,
+    db: EmbeddingDatabase | undefined
   ) {
     this._view = view
     this._statusBar = statusBar
     this._templateProvider = new TemplateProvider(templateDir)
     this._extensionContext = extensionContext
-    this._conversationHistory = conversationHistory
+    this._db = db
     workspace.onDidChangeConfiguration((event) => {
       if (!event.affectsConfiguration('twinny')) {
         return
       }
       this.updateConfig()
     })
+  }
+
+  private async getSimilarChunks(text: string | undefined) {
+    if (!this._db || !text) return
+    if (await this._db.hasEmbeddingTable()) {
+      const embedding = await this._db.fetchModelEmbedding(text)
+      const documents = (await this._db.getDocuments(embedding, 2)) || []
+
+      const codeChunks =
+        documents
+          ?.map(({ content }: { content: string }) =>
+            `
+              Context Code:
+              \`\`\`
+              ${content}
+              \`\`\`
+            `.trim()
+          )
+          .join('\n\n')
+          .trim() || ''
+
+      return codeChunks
+    }
+    return ''
   }
 
   private getProvider = () => {
@@ -102,7 +126,7 @@ export class ChatService {
   }
 
   private onStreamData = (
-    streamResponse: StreamResponse | undefined,
+    streamResponse: StreamResponse,
     onEnd?: (completion: string) => void
   ) => {
     const provider = this.getProvider()
@@ -201,11 +225,15 @@ export class ChatService {
     const selection = editor?.selection
     const selectionContext =
       editor?.document.getText(selection) || context || ''
+
+    const similarCode = await this.getSimilarChunks(selectionContext)
+
     const prompt = await this._templateProvider?.renderTemplate<TemplateData>(
       template,
       {
         code: selectionContext || '',
-        language: language?.langName || 'unknown'
+        language: language?.langName || 'unknown',
+        similarCode
       }
     )
     return { prompt: prompt || '', selection: selectionContext }
@@ -223,8 +251,8 @@ export class ChatService {
     return streamResponse({
       body: requestBody,
       options: requestOptions,
-      onData: (streamResponse: StreamResponse | undefined) =>
-        this.onStreamData(streamResponse, onEnd),
+      onData: (streamResponse) =>
+        this.onStreamData(streamResponse as StreamResponse, onEnd),
       onEnd: () => this.onStreamEnd(onEnd),
       onStart: this.onStreamStart,
       onError: this.onStreamError
@@ -263,15 +291,27 @@ export class ChatService {
       )
     }
 
-    const conversation = [
-      systemMessage,
-      ...messages,
-    ]
+    const lastMessage = messages[messages.length - 1]
+
+    const similarCode = await this.getSimilarChunks(lastMessage.content)
+
+    const conversation = [systemMessage, ...messages]
 
     if (selectionContext) {
+      conversation.push(
+        {
+          role: USER,
+          content: `Use this code as a context for the next response: ${selectionContext}`
+        },
+        {
+          role: USER,
+          content: `Use this similar code as a context for the next response if it is relevant: ${similarCode}`
+        }
+      )
+    } else if (similarCode) {
       conversation.push({
         role: USER,
-        content: `Use this code as a context for the next response: ${selectionContext}`
+        content: `Use this similar code as a context for the next response if it is relevant: ${similarCode}`
       })
     }
 
